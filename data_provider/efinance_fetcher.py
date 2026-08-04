@@ -875,6 +875,10 @@ class EfinanceFetcher(BaseFetcher):
                     continue
                 item = row.iloc[0]
 
+                # Debug: 首次迭代时记录实际列名，便于排查字段缺失问题
+                if not results:
+                    logger.info(f"[efinance] 指数行情实际列名: {list(df.columns)}")
+
                 price_col = '最新价' if '最新价' in df.columns else 'price'
                 pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
                 chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
@@ -884,6 +888,8 @@ class EfinanceFetcher(BaseFetcher):
                 vol_col = '成交量' if '成交量' in df.columns else 'volume'
                 amt_col = '成交额' if '成交额' in df.columns else 'amount'
                 amp_col = '振幅' if '振幅' in df.columns else 'amplitude'
+                # 昨收列名兼容（efinance 指数端点可能不返回此列）
+                prev_close_cols = [c for c in ('昨收', '昨收盘', 'prev_close', 'pre_close') if c in df.columns]
 
                 current = safe_float(item.get(price_col, 0))
                 change_amount = safe_float(item.get(chg_col, 0))
@@ -896,16 +902,37 @@ class EfinanceFetcher(BaseFetcher):
                 if open_price == 0.0 and open_cols:
                     open_price = safe_float(item.get(open_cols[0], 0), 0)
 
+                # 优先从昨收列获取 prev_close
+                prev_close = 0.0
+                for pc_col in prev_close_cols:
+                    candidate = safe_float(item.get(pc_col), default=None)
+                    if candidate not in (None, 0.0):
+                        prev_close = candidate
+                        break
+                # 昨收列不存在时，从 current - change_amount 回推
+                if prev_close == 0.0:
+                    prev_close = current - change_amount if current or change_amount else 0
+
+                # 涨跌幅为0但有昨收价时，自行计算
+                change_pct = safe_float(item.get(pct_col, 0))
+                if change_pct == 0 and current > 0 and prev_close > 0:
+                    change_pct = (current - prev_close) / prev_close * 100
+                    logger.debug(f"[efinance] {name}: 涨跌幅列缺失，自行计算 = {change_pct:.4f}%")
+
+                # 涨跌额为0但有昨收价时，自行计算
+                if change_amount == 0 and current > 0 and prev_close > 0:
+                    change_amount = current - prev_close
+
                 results.append({
                     'code': full_code,
                     'name': name,
                     'current': current,
                     'change': change_amount,
-                    'change_pct': safe_float(item.get(pct_col, 0)),
+                    'change_pct': change_pct,
                     'open': open_price,
                     'high': safe_float(item.get(high_col, 0)),
                     'low': safe_float(item.get(low_col, 0)),
-                    'prev_close': current - change_amount if current or change_amount else 0,
+                    'prev_close': prev_close,
                     'volume': safe_float(item.get(vol_col, 0)),
                     'amount': safe_float(item.get(amt_col, 0)),
                     'amplitude': safe_float(item.get(amp_col, 0)),
