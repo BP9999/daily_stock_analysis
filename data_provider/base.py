@@ -2475,6 +2475,14 @@ class DataFetcherManager:
             try:
                 data = fetcher.get_main_indices(region=region)
                 if data:
+                    # 数据质量验证：如果所有指数的涨跌幅都为0，视为字段缺失，尝试下一个数据源
+                    if region == "cn" and len(data) > 0 and all(
+                        idx.get('change_pct', 0) == 0 for idx in data
+                    ):
+                        logger.warning(
+                            f"[{fetcher.name}] 指数行情涨跌幅全为0，可能字段缺失，尝试下一个数据源"
+                        )
+                        continue
                     logger.info(f"[{fetcher.name}] 获取指数行情成功")
                     return data
             except Exception as e:
