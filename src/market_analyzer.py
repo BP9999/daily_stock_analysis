@@ -1935,7 +1935,9 @@ Output the report content directly, no extra commentary.
         indices_text = ""
         for idx in overview.indices[:4]:
             marker = self._get_index_change_arrow(idx.change_pct)
+
             indices_text += f"- **{idx.name}**: 收盘 {idx.current:.2f} ({marker} {idx.change_pct:+.2f}%)\n"
+
         
         # 板块信息
         separator = ", " if template_language == "en" else "、"
