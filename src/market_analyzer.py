@@ -80,6 +80,7 @@ class MarketIndex:
             'current': self.current,
             'change': self.change,
             'change_pct': self.change_pct,
+            'prev_close': self.prev_close,
             'open': self.open,
             'high': self.high,
             'low': self.low,
@@ -1352,12 +1353,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return ""
         if self._get_review_language() == "en":
             lines = [
-                f"| Index | Last | Change % | Open | High | Low | Amplitude | Turnover ({self._get_turnover_unit_label()}) |",
-                "|-------|------|----------|------|------|-----|-----------|-----------------|",
+                f"| Index | Close | Change % | Open | High | Low | Amplitude | Turnover ({self._get_turnover_unit_label()}) |",
+                "|-------|-------|----------|------|------|-----|-----------|-----------------|",
             ]
         else:
             lines = [
-                "| 指数 | 最新 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额(亿) |",
+                "| 指数 | 收盘 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额(亿) |",
                 "|------|------|--------|------|------|------|------|-----------|",
             ]
         for idx in overview.indices:
@@ -1660,7 +1661,21 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         indices_text = ""
         for idx in overview.indices:
             direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
-            indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+            # 注意：current 在收盘后即收盘价；同时提供开盘/最高/最低/昨收，
+            # 让 LLM 能对"收盘价与涨跌幅"做交叉验证，避免把开盘价当收盘价解读。
+            ohlc_parts = []
+            if idx.open > 0:
+                ohlc_parts.append(f"开盘 {idx.open:.2f}")
+            if idx.high > 0:
+                ohlc_parts.append(f"最高 {idx.high:.2f}")
+            if idx.low > 0:
+                ohlc_parts.append(f"最低 {idx.low:.2f}")
+            if idx.prev_close > 0:
+                ohlc_parts.append(f"昨收 {idx.prev_close:.2f}")
+            ohlc_text = f"（{'，'.join(ohlc_parts)}）" if ohlc_parts else ""
+            indices_text += (
+                f"- {idx.name}: 收盘 {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%){ohlc_text}\n"
+            )
         
         # 板块信息
         top_sectors_text = self._format_ranking_summary(overview.top_sectors)
@@ -1920,7 +1935,7 @@ Output the report content directly, no extra commentary.
         indices_text = ""
         for idx in overview.indices[:4]:
             marker = self._get_index_change_arrow(idx.change_pct)
-            indices_text += f"- **{idx.name}**: {idx.current:.2f} ({marker} {idx.change_pct:+.2f}%)\n"
+            indices_text += f"- **{idx.name}**: 收盘 {idx.current:.2f} ({marker} {idx.change_pct:+.2f}%)\n"
         
         # 板块信息
         separator = ", " if template_language == "en" else "、"
