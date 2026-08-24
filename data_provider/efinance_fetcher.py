@@ -875,6 +875,10 @@ class EfinanceFetcher(BaseFetcher):
                     continue
                 item = row.iloc[0]
 
+                # Debug: 首次迭代时记录实际列名，便于排查字段缺失问题
+                if not results:
+                    logger.info(f"[efinance] 指数行情实际列名: {list(df.columns)}")
+
                 price_col = '最新价' if '最新价' in df.columns else 'price'
                 pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
                 chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
@@ -884,6 +888,8 @@ class EfinanceFetcher(BaseFetcher):
                 vol_col = '成交量' if '成交量' in df.columns else 'volume'
                 amt_col = '成交额' if '成交额' in df.columns else 'amount'
                 amp_col = '振幅' if '振幅' in df.columns else 'amplitude'
+                # 昨收列名兼容（efinance 指数端点可能不返回此列）
+                prev_close_cols = [c for c in ('昨收', '昨收盘', 'prev_close', 'pre_close') if c in df.columns]
 
                 current = safe_float(item.get(price_col, 0))
                 change_amount = safe_float(item.get(chg_col, 0))
@@ -896,16 +902,102 @@ class EfinanceFetcher(BaseFetcher):
                 if open_price == 0.0 and open_cols:
                     open_price = safe_float(item.get(open_cols[0], 0), 0)
 
+                # 优先从昨收列获取 prev_close
+                prev_close = 0.0
+                for pc_col in prev_close_cols:
+                    candidate = safe_float(item.get(pc_col), default=None)
+                    if candidate not in (None, 0.0):
+                        prev_close = candidate
+                        break
+                # 昨收列不存在时，从 current - change_amount 回推
+                if prev_close == 0.0:
+                    prev_close = current - change_amount if current or change_amount else 0
+
+                # 涨跌幅为0但有昨收价时，自行计算
+                change_pct = safe_float(item.get(pct_col, 0))
+                if change_pct == 0 and current > 0 and prev_close > 0:
+                    change_pct = (current - prev_close) / prev_close * 100
+                    logger.debug(f"[efinance] {name}: 涨跌幅列缺失，自行计算 = {change_pct:.4f}%")
+
+                # 涨跌额为0但有昨收价时，自行计算
+                if change_amount == 0 and current > 0 and prev_close > 0:
+                    change_amount = current - prev_close
+
+                high_price = safe_float(item.get(high_col, 0))
+                low_price = safe_float(item.get(low_col, 0))
+
+                # ===== 数据自洽性校验与修复（防止把开盘价/旧快照当收盘价）=====
+                # 场景1：最新价缺失/为0，但有昨收和涨跌幅 -> 用昨收×涨跌幅重建收盘价
+                if current <= 0 and prev_close > 0 and change_pct != 0:
+                    rebuilt = prev_close * (1 + change_pct / 100)
+                    if rebuilt > 0:
+                        logger.warning(
+                            f"[efinance] {name}: 最新价缺失({current})，用昨收×涨跌幅重建 = {rebuilt:.2f}"
+                        )
+                        current = rebuilt
+                        change_amount = current - prev_close
+
+                # 场景2：最新价越出日内 [low, high] 区间（数据错乱的典型特征）
+                #   有昨收+涨跌幅时用其重建；重建后仍在界外则丢弃该指数，触发降级
+                if current > 0 and high_price > 0 and low_price > 0 and not (
+                    low_price <= current <= high_price
+                ):
+                    rebuilt = (
+                        prev_close * (1 + change_pct / 100)
+                        if prev_close > 0 and change_pct != 0
+                        else 0.0
+                    )
+                    if rebuilt > 0 and low_price <= rebuilt <= high_price:
+                        logger.warning(
+                            f"[efinance] {name}: 最新价 {current:.2f} 越出日内区间 "
+                            f"[{low_price:.2f}, {high_price:.2f}]，用昨收×涨跌幅重建 = {rebuilt:.2f}"
+                        )
+                        current = rebuilt
+                        change_amount = current - prev_close
+                    else:
+                        logger.error(
+                            f"[efinance] {name}: 最新价 {current:.2f} 越出日内区间 "
+                            f"[{low_price:.2f}, {high_price:.2f}] 且无法重建，丢弃该指数数据"
+                        )
+                        continue
+
+                # 场景3：涨跌幅与收盘价推算值矛盾。
+                #   根因常见于"最新价被接口误报为开盘价/盘中价"（价格错了但涨跌幅字段是对的）。
+                #   优先信任涨跌幅字段，用 昨收×(1+涨跌幅) 反推真实收盘价；
+                #   反推值落在日内 [low, high] 区间内才采纳，否则退化为以价格链路重算涨跌幅。
+                if current > 0 and prev_close > 0:
+                    expected_pct = (current - prev_close) / prev_close * 100
+                    if abs(expected_pct - change_pct) > 0.5:
+                        implied_close = prev_close * (1 + change_pct / 100)
+                        if (
+                            implied_close > 0
+                            and (high_price <= 0 or low_price <= 0 or low_price <= implied_close <= high_price)
+                        ):
+                            logger.warning(
+                                f"[efinance] {name}: 最新价 {current:.2f} 与涨跌幅 {change_pct:.2f}% 矛盾，"
+                                f"疑似把开盘价/盘中价当收盘价，用涨跌幅反推真实收盘价 = {implied_close:.2f}"
+                            )
+                            current = implied_close
+                            change_amount = current - prev_close
+                        else:
+                            logger.warning(
+                                f"[efinance] {name}: 涨跌幅 {change_pct:.2f}% 与收盘价推算 "
+                                f"{expected_pct:.2f}% 不一致，反推值 {implied_close:.2f} 不在日内区间，"
+                                f"以价格链路重算涨跌幅"
+                            )
+                            change_pct = expected_pct
+                            change_amount = current - prev_close
+
                 results.append({
                     'code': full_code,
                     'name': name,
                     'current': current,
                     'change': change_amount,
-                    'change_pct': safe_float(item.get(pct_col, 0)),
+                    'change_pct': change_pct,
                     'open': open_price,
-                    'high': safe_float(item.get(high_col, 0)),
-                    'low': safe_float(item.get(low_col, 0)),
-                    'prev_close': current - change_amount if current or change_amount else 0,
+                    'high': high_price,
+                    'low': low_price,
+                    'prev_close': prev_close,
                     'volume': safe_float(item.get(vol_col, 0)),
                     'amount': safe_float(item.get(amt_col, 0)),
                     'amplitude': safe_float(item.get(amp_col, 0)),
@@ -913,10 +1005,71 @@ class EfinanceFetcher(BaseFetcher):
 
             if results:
                 logger.info(f"[efinance] 获取到 {len(results)} 个指数行情")
+            # 跨源自检：东财与新浪独立源收盘价偏差过大时，判定为旧快照/错误数据，
+            # 返回 None 让 Manager 降级到 akshare（新浪，字段完整）。
+            if results and self._looks_stale_vs_sina(results):
+                logger.error("[efinance] 指数行情与新浪独立源偏差过大，疑似旧快照，返回 None 触发降级")
+                return None
             return results if results else None
         except Exception as e:
             logger.error(f"[efinance] 获取指数行情失败: {e}")
             return None
+
+    def _looks_stale_vs_sina(
+        self, results: List[Dict[str, Any]], tolerance_pct: float = 0.3
+    ) -> bool:
+        """用新浪独立源（akshare）交叉验证指数收盘价，识别旧快照。
+
+        东财与新浪是两套独立行情源。若东财返回的是前一交易日快照或
+        未结算数据（把开盘价/前日收盘价当收盘价），两者收盘价会显著偏离。
+        返回 True 表示东财数据可疑，调用方应放弃本数据源以降级。
+        自检源失败时 fail-open（返回 False，信任东财，避免误伤）。
+        """
+        try:
+            import akshare as ak
+            sina = ak.stock_zh_index_spot_sina()
+            if sina is None or sina.empty or '代码' not in sina.columns or '最新价' not in sina.columns:
+                return False
+            sina_by_code: Dict[str, float] = {}
+            for _, row in sina.iterrows():
+                code = str(row.get('代码', '')).strip()
+                if not code:
+                    continue
+                val = safe_float(row.get('最新价', 0))
+                if val <= 0:
+                    continue
+                sina_by_code[code] = val
+                # 兼容无前缀形式（'000001' 与 'sh000001'）
+                if len(code) == 8 and code[:2] in ('sh', 'sz', 'bj'):
+                    sina_by_code[code[2:]] = val
+
+            max_dev = 0.0
+            compared = 0
+            for idx in results:
+                full_code = idx.get('code', '')
+                sina_current = sina_by_code.get(full_code, 0)
+                if sina_current <= 0 and len(full_code) == 8:
+                    sina_current = sina_by_code.get(full_code[2:], 0)
+                if sina_current <= 0:
+                    continue
+                east_current = idx.get('current', 0) or 0
+                if east_current <= 0:
+                    continue
+                compared += 1
+                max_dev = max(max_dev, abs(east_current - sina_current) / sina_current * 100)
+
+            if compared == 0:
+                return False
+            if max_dev >= tolerance_pct:
+                logger.warning(
+                    f"[efinance] 与新浪独立源收盘价最大偏差 {max_dev:.3f}%，疑似旧快照/错误数据"
+                )
+                return True
+            logger.info(f"[efinance] 与新浪独立源收盘价一致(最大偏差 {max_dev:.3f}%)")
+            return False
+        except Exception as e:
+            logger.warning(f"[efinance] 新浪独立源自检失败，fail-open 信任东财: {e}")
+            return False
 
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
