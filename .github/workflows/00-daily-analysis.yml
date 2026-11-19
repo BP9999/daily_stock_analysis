@@ -469,7 +469,7 @@ jobs:
           if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
             export STOCK_LIST="$STOCK_LIST_CONFIG"
           elif [ -z "${STOCK_LIST:-}" ]; then
-            export STOCK_LIST="002815"
+            export STOCK_LIST="002378,002815"
           fi
 
           # 处理 LITELLM YAML 配置文件
