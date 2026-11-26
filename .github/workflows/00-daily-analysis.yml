@@ -467,8 +467,8 @@ jobs:
           # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
           # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
           # 3. 最小默认值
-          # 硬编码自选股：章源钨业(002378) + 崇达技术(002815)，绕过 secret/var 优先级
-          export STOCK_LIST="002378,002815"
+          # 自选股：优先读仓库变量 STOCK_LIST（回落 002815 崇达技术 + sh000001 上证指数）
+          export STOCK_LIST="${STOCK_LIST_CONFIG:-002815,sh000001}"
 
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
